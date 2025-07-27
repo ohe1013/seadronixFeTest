@@ -1,0 +1,236 @@
+<!DOCTYPE html>
+<html lang="ko">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Muxed A/V Streaming (Worker)</title>
+    <style>
+      body {
+        margin: 0;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        background-color: #222;
+        color: #eee;
+        font-family: sans-serif;
+      }
+      #controls {
+        margin: 10px;
+        background-color: #333;
+        padding: 10px;
+        border-radius: 8px;
+        box-shadow: 0 2px 4px rgba(0, 0, 0, 0.2);
+      }
+      #urlInput {
+        padding: 5px;
+        border-radius: 4px;
+        border: 1px solid #555;
+        background-color: #444;
+        color: #eee;
+      }
+      button {
+        padding: 5px 10px;
+        border-radius: 4px;
+        border: none;
+        background-color: #007bff;
+        color: white;
+        cursor: pointer;
+        margin-left: 5px;
+      }
+      button:hover {
+        background-color: #0056b3;
+      }
+      #seekInput {
+        padding: 5px;
+        border-radius: 4px;
+        border: 1px solid #555;
+        background-color: #444;
+        color: #eee;
+      }
+      #videoCanvas {
+        background: #000;
+        border: 1px solid #555;
+      }
+      /* Canvas 픽셀 보존을 위해 pixelated 모드 추가 */
+      canvas {
+        image-rendering: pixelated;
+        image-rendering: -moz-crisp-edges;
+        image-rendering: -webkit-optimize-contrast;
+      }
+      #status {
+        margin-top: 10px;
+        font-size: 14px;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="controls">
+      <!-- 1) 로컬 파일 업로드 -->
+      <input type="file" id="fileInput" accept="video/*" />
+      <!-- 2) 또는 URL 직접 입력 -->
+      <label for="urlInput">url</label>
+      <input
+        type="text"
+        id="urlInput"
+        size="40"
+        value="http://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ElephantsDream.mp4"
+        placeholder="또는 URL 입력"
+      />
+      <button id="startBtn">시작</button>
+      &nbsp;|&nbsp;
+      <!-- <input id="seekInput" type="number" value="0" style="width: 60px" /> -->
+      <!-- <button id="seekBtn">Seek</button> -->
+    </div>
+
+    <canvas id="videoCanvas" width="1280" height="720"></canvas>
+    <script>
+      const fileInput = document.getElementById("fileInput");
+      const urlInput = document.getElementById("urlInput");
+      const startBtn = document.getElementById("startBtn");
+      const seekInput = document.getElementById("seekInput");
+      // const seekBtn = document.getElementById("seekBtn");
+      const canvas = document.getElementById("videoCanvas");
+      const ctx = canvas.getContext("2d");
+
+      let worker;
+      let audioCtx;
+      let startAudioTime = 0;
+      let firstAudioTimestamp = 0;
+      const audioConfig = {
+        codec: "mp4a.40.2", // AAC-LC (일반적인 AAC 코덱)
+        sampleRate: 48000, // 서버의 AAC 출력 샘플레이트에 맞춰야 함
+        numberOfChannels: 2, // 서버의 AAC 출력 채널 수에 맞춰야 함
+      };
+      // 워커로부터 메시지 수신
+      function handleWorkerMessage(ev) {
+        const { type, frame, audioData, stats, offsetSec } = ev.data;
+
+        if (type === "decodedVideoFrame") {
+          // 캔버스 크기 설정 및 프레임 그리기
+
+          canvas.width = frame.codedWidth;
+          canvas.height = frame.codedHeight;
+          ctx.drawImage(frame, 0, 0);
+          const processingLatency = (Date.now() - stats.recvMainTime).toFixed(
+            1
+          );
+
+          // 지연 시간 정보 오버레이
+          const now = performance.now();
+
+          // ✨ 이름 변경: Render Latency -> Processing Latency (처리 지연 시간)
+          // 워커 도착부터 메인 스레드 렌더링까지 걸린 시간
+
+          // ✨ 이름 변경: E2E Latency -> Server E2E Latency (서버 종단간 지연)
+          // 서버 전송부터 메인 스레드 렌더링까지 걸린 시간
+          const serverE2ELatency = (
+            performance.timeOrigin +
+            now -
+            stats.serverTs
+          ).toFixed(1);
+
+          ctx.font = "16px sans-serif";
+          ctx.fillStyle = "yellow";
+          ctx.textBaseline = "top";
+          ctx.fillText(
+            `Network:      ${stats.networkLatency.toFixed(1)} ms`,
+            10,
+            10
+          );
+          ctx.fillText(`Processing:   ${processingLatency} ms`, 10, 30);
+          ctx.fillText(`Server E2E:   ${serverE2ELatency} ms`, 10, 50);
+
+          frame.close(); // 프레임 리소스 해제
+        } else if (type === "decodedAudioChunk") {
+          playAudio(audioData, offsetSec);
+        } else if (type === "status") {
+          // console.log(`[Worker Status] ${ev.data.message}`);
+        }
+      }
+
+      function playAudio(audioData, offsetSec) {
+        const buffer = audioCtx.createBuffer(
+          audioData.numberOfChannels,
+          audioData.numberOfFrames,
+          audioData.sampleRate
+        );
+        for (let i = 0; i < audioData.numberOfChannels; i++) {
+          const channelData = new Float32Array(audioData.numberOfFrames);
+          audioData.copyTo(channelData, { planeIndex: i });
+          buffer.copyToChannel(channelData, i);
+        }
+
+        const source = audioCtx.createBufferSource();
+        source.buffer = buffer;
+        source.connect(audioCtx.destination);
+
+        const playAt = startAudioTime + offsetSec;
+        // if (playAt > audioCtx.currentTime) source.start(playAt);
+        // else source.start();
+        source.start();
+        audioData.close();
+      }
+
+      function initWorker() {
+        worker?.terminate();
+        worker = new Worker("decoderWorker.js");
+        worker.onmessage = handleWorkerMessage;
+        // AudioContext 준비
+        if (!audioCtx) audioCtx = new AudioContext();
+        if (audioCtx.state === "suspended") audioCtx.resume();
+        firstAudioTimestamp = 0;
+        startAudioTime = audioCtx.currentTime;
+      }
+      fileInput.addEventListener("change", () => {
+        const file = fileInput.files[0];
+        if (!file) return;
+
+        initWorker();
+        worker.postMessage({
+          type: "start-upload",
+
+          baseURL: `ws://${location.host}/stream`,
+          audioConfig,
+        });
+
+        const CHUNK = 64 * 1024;
+        let offset = 0;
+        const reader = new FileReader();
+        reader.onload = (e) => {
+          worker.postMessage({ type: "file-chunk", chunk: e.target.result }, [
+            e.target.result,
+          ]);
+          offset += CHUNK;
+          if (offset < file.size) {
+            reader.readAsArrayBuffer(file.slice(offset, offset + CHUNK));
+          } else {
+            worker.postMessage({ type: "file-end" });
+          }
+        };
+        reader.readAsArrayBuffer(file.slice(0, CHUNK));
+      });
+      function start() {
+        initWorker();
+        // 워커에 스트리밍 시작 명령
+        worker.postMessage({
+          type: "start-url",
+          url: urlInput.value,
+          baseURL: `ws://${location.host}/stream`,
+          audioConfig,
+        });
+      }
+
+      startBtn.onclick = start;
+
+      // seekBtn.onclick = () => {
+      //   const time = parseFloat(seekInput.value);
+      //   if (!isNaN(time) && worker) {
+      //     // console.log("▶ Main: sending seek command to worker", time);
+      //     // 오디오 컨텍스트 초기화
+      //     startAudioTime = audioCtx.currentTime;
+      //     firstAudioTimestamp = 0;
+      //     worker.postMessage({ type: "seek", time });
+      //   }
+      // };
+    </script>
+  </body>
+</html>
